@@ -54,6 +54,77 @@ def is_notein_bundle(path: Path) -> bool:
         return False
 
 
+NOTEIN_TRASH_FOLDER = "_Trash"
+INVALID_PATH_CHARS = '<>:"/\\|?*'
+
+
+def _safe_path_part(name: str) -> str:
+    cleaned = "".join("_" if c in INVALID_PATH_CHARS or ord(c) < 32 else c for c in name)
+    return cleaned.strip().rstrip(".") or "_"
+
+
+def _read_notein_json(zf: zipfile.ZipFile, name: str) -> dict:
+    try:
+        value = json.loads(zf.read(name))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_notein_folder_meta(path: Path) -> Optional[dict]:
+    """Return the metadata of a Notein folder bundle, or None if it's not one"""
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            for name in zf.namelist():
+                if name.startswith("folder_") and not name.startswith("folder_tn_") and name != "folder_labels.json":
+                    return _read_notein_json(zf, name)
+    except Exception:
+        pass
+    return None
+
+
+def read_notein_note_meta(path: Path) -> dict:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return _read_notein_json(zf, "note_meta.json")
+    except Exception:
+        return {}
+
+
+def build_notein_folder_paths(files: List[Path]) -> Dict[str, Path]:
+    """Map Notein folder ids to their relative folder path, from the folder bundles"""
+    folders = {}
+    for path in files:
+        meta = read_notein_folder_meta(path) if zipfile.is_zipfile(path) else None
+        if meta and meta.get("id"):
+            folders[meta["id"]] = meta
+
+    resolved: Dict[str, Path] = {}
+
+    def resolve(folder_id: str, seen: set) -> Path:
+        if folder_id in resolved:
+            return resolved[folder_id]
+        meta = folders[folder_id]
+        path = Path(_safe_path_part(meta.get("title") or folder_id))
+        parent_id = meta.get("parentId")
+        if parent_id in folders and parent_id not in seen:
+            path = resolve(parent_id, seen | {folder_id}) / path
+        resolved[folder_id] = path
+        return path
+
+    for folder_id in folders:
+        resolve(folder_id, set())
+    return resolved
+
+
+def notein_folder_path(note_file: Path, folder_paths: Dict[str, Path]) -> Path:
+    """Relative output folder for a Notein note, based on its parent folder"""
+    meta = read_notein_note_meta(note_file)
+    if meta.get("inTrashBin"):
+        return Path(NOTEIN_TRASH_FOLDER)
+    return folder_paths.get(meta.get("parentId") or "", Path())
+
+
 def is_notein_drive_candidate(file: dict) -> bool:
     name = file.get("name", "")
     lower_name = name.lower()
@@ -202,23 +273,27 @@ class CloudSyncManager:
         """Process all source files in local directory recursively"""
         converted = 0
         if self.notein:
-            nsa_files = [
-                path for path in self.local_dir.rglob("*")
-                if path.is_file() and is_notein_bundle(path)
-            ]
+            all_files = [path for path in self.local_dir.rglob("*") if path.is_file()]
+            nsa_files = [path for path in all_files if is_notein_bundle(path)]
+            # Notein syncs folders as separate bundles; rebuild the hierarchy from them
+            folder_paths = build_notein_folder_paths(all_files)
         else:
             nsa_files = list(self.local_dir.rglob("*.nsa"))
-        
+
         if verbose:
             print(f"Found {len(nsa_files)} {self.source_extension} in {self.local_dir}")
-        
+
         for nsa_file in nsa_files:
-            # Mirror folder structure in output
-            try:
-                rel_path = nsa_file.relative_to(self.local_dir)
-                pdf_path = self.output_dir / rel_path.parent / (output_stem_for_source(nsa_file, self.notein) + ".pdf")
-            except ValueError:
-                pdf_path = self.output_dir / (output_stem_for_source(nsa_file, self.notein) + ".pdf")
+            stem = output_stem_for_source(nsa_file, self.notein) + ".pdf"
+            if self.notein:
+                pdf_path = self.output_dir / notein_folder_path(nsa_file, folder_paths) / stem
+            else:
+                # Mirror folder structure in output
+                try:
+                    rel_path = nsa_file.relative_to(self.local_dir)
+                    pdf_path = self.output_dir / rel_path.parent / stem
+                except ValueError:
+                    pdf_path = self.output_dir / stem
             
             if self._needs_conversion(nsa_file, pdf_path):
                 if self.convert_file(nsa_file, pdf_path, verbose=verbose):
@@ -545,17 +620,20 @@ class GoogleDriveSync(CloudSyncManager):
         converted = 0
         nsa_files = [Path(p) for p in self.file_metadata.keys()]
         if self.notein:
+            folder_paths = build_notein_folder_paths([path for path in nsa_files if path.is_file()])
             nsa_files = [path for path in nsa_files if is_notein_bundle(path)]
-        
+
         if verbose:
             print(f"\nProcessing {len(nsa_files)} {self.source_extension} for conversion")
-        
+
         for nsa_file in nsa_files:
             # Get folder path from metadata using resolved path
             resolved_path = nsa_file.resolve()
             metadata = self.file_metadata.get(str(resolved_path), {})
             folder_path = metadata.get('folder_path', '')
-            
+            if self.notein:
+                folder_path = Path(folder_path) / notein_folder_path(nsa_file, folder_paths)
+
             # Construct PDF output path with folder structure
             if folder_path:
                 pdf_path = self.output_dir / folder_path / (output_stem_for_source(nsa_file, self.notein) + ".pdf")
