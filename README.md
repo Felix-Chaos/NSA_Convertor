@@ -80,6 +80,8 @@ Notein support
 ```bash
 python sync_and_convert.py --provider local --local-dir <dir> --notein
 ```
+PDFs are placed in the same folder structure as in Notein (rebuilt from the synced folder bundles). Notes that are in Notein's trash go to `_Trash/`.
+
 or specify `DEFAULT_PATH` in `.env` and emit `--outdir`
 
 ## Google Drive Sync
